@@ -2,21 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-AnswersToMarkdown.py  (upgraded)
+AnswersToMarkdown.py  (independent-article friendly)
 
-Microsoft Answers（日本語版）から Edge の「Web ページ、完全」保存で得られた
-アーカイブ一式から、記事本文（タイトル記事）だけを抽出して Markdown に変換します。
+目的:
+- Microsoft Answers の Edge 保存アーカイブから、本文を抽出し Markdown を生成
+- GitHub などで「独立記事」として扱いやすいように最適化
 
 追加機能:
-1) すべてのリンク（src/href）の「スペース」を %20 に置換（URL 内の既存 %20 は維持）
-2) 画像ファイルの参照が「拡張子なし」の場合、.png ファイルとして同ディレクトリにコピーし、参照も .png に書き換える
-   （常時上書き。対象はローカル相対パスのみ。外部URLは対象外）
+1) タイトル末尾の " - Microsoft コミュニティ" を削除
+2) 画像（ローカル）を Markdown 出力先フォルダへコピー
+   - 拡張子なし -> .png を付けてコピー
+   - .png      -> そのまま .png でコピー
+   - その他の拡張子は現状対象外（必要なら拡張可能）
+3) Markdown 内の画像/リンクは、コピー後の **ファイル名だけ** を参照
+4) スペースを %20 に置換（URL 内の既存 %20 は維持）
 
 使い方:
     python3 AnswersToMarkdown.py "WebArchiveFolderName"
 
 出力:
     WebArchiveFolderName/WebArchiveFolderName.md
+    + 同ディレクトリに *.png ファイル（コピー）が生成される場合あり
 
 依存:
     pip install beautifulsoup4
@@ -26,12 +32,6 @@ import sys, os, re, shutil, urllib.parse
 from pathlib import Path
 from typing import Tuple, Dict
 from bs4 import BeautifulSoup, NavigableString, Tag
-
-# オプション: Markdown 出力時に "./" を削る（GitHub ではどちらでも可）
-STRIP_LEADING_DOT_SLASH = True
-
-# オプション: 拡張子なし画像をコピーするときに付ける拡張子
-FORCE_COPY_NOEXT_AS = ".png"   # ご要望に合わせて PNG 固定
 
 def error_exit(msg: str, code: int = 1):
     print(f"[ERROR] {msg}", file=sys.stderr)
@@ -46,85 +46,52 @@ def find_single_html_file(folder: Path) -> Path:
         error_exit(f"HTML ファイルが複数見つかりました（1つに絞ってください）: {names}")
     return htmls[0]
 
-def encode_spaces_and_normalize(path_str: str) -> str:
-    # 先頭 "./" を削除（任意）
-    if STRIP_LEADING_DOT_SLASH and path_str.startswith("./"):
-        path_str = path_str[2:]
-    # スペースのみ %20 へ（既存の %20 はそのまま）
-    return path_str.replace(" ", "%20")
+def is_external(url: str) -> bool:
+    return bool(re.match(r'^[a-zA-Z]+://', url or ""))
 
-def resolve_local_path(base_folder: Path, url_or_path: str) -> Path | None:
-    # スキーム付き（http, https など）は対象外
-    if re.match(r'^[a-zA-Z]+://', url_or_path or ""):
+def encode_spaces(s: str) -> str:
+    return s.replace(" ", "%20") if s else s
+
+def local_fs_path(base_folder: Path, url_or_path: str) -> Path | None:
+    if not url_or_path or is_external(url_or_path) or url_or_path.startswith("#"):
         return None
-    if not url_or_path:
-        return None
-    # ファイルシステム上は %20 -> 空白 に戻す
     fs_path = urllib.parse.unquote(url_or_path)
     if fs_path.startswith("./"):
         fs_path = fs_path[2:]
-    abs_path = (base_folder / fs_path).resolve()
-    return abs_path
+    return (base_folder / fs_path).resolve()
 
-def ensure_png_copy_for_path(base_folder: Path, url_or_path: str, mapping: Dict[str, str]) -> Tuple[str, bool]:
+def copy_image_to_outdir(base_folder: Path, out_folder: Path, url_or_path: str, mapping: Dict[str, str]) -> Tuple[str,bool]:
     """
-    - ローカル相対パスで、拡張子なし & 実在するファイルなら、同ディレクトリに .png を付けたコピーを作る
-    - 以降、参照は .png に差し替え
-    - 2重コピー防止のため mapping を使う
+    ローカル相対パスの画像を Markdown 出力先にコピーし、参照をファイル名のみへ差し替える。
+    - 拡張子なし -> .png でコピー
+    - .png       -> そのままコピー
+    - その他拡張子 -> 現状はコピーせず、そのまま（必要なら拡張可）
     """
-    if not url_or_path or url_or_path.startswith("#"):
-        return url_or_path, False
-    if re.match(r'^[a-zA-Z]+://', url_or_path):
+    if not url_or_path or is_external(url_or_path) or url_or_path.startswith("#"):
         return url_or_path, False
 
     key = url_or_path
     if key in mapping:
         return mapping[key], True
 
-    abs_path = resolve_local_path(base_folder, url_or_path)
-    if abs_path is None or not abs_path.exists() or abs_path.is_dir():
+    abs_src = local_fs_path(base_folder, url_or_path)
+    if abs_src is None or not abs_src.exists() or abs_src.is_dir():
         return url_or_path, False
 
-    if abs_path.suffix:
-        # すでに拡張子がある場合はそのまま
+    if abs_src.suffix.lower() == ".png":
+        dest_name = abs_src.name
+    elif abs_src.suffix == "":
+        dest_name = abs_src.name + ".png"
+    else:
+        # 非PNGは対象外（必要なら変換/コピー処理を追加）
         return url_or_path, False
 
-    # .png を付けたコピーを作成
-    dest_abs = abs_path.with_suffix(FORCE_COPY_NOEXT_AS)
+    dest_abs = out_folder / dest_name
     dest_abs.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(abs_path, dest_abs)
+    shutil.copyfile(abs_src, dest_abs)
 
-    # Markdown 用の相対パス（/ 区切り）
-    rel = os.path.relpath(dest_abs, base_folder).replace(os.sep, "/")
-    mapping[key] = rel
-    return rel, True
-
-def preprocess_links_and_images(content_root: Tag, base_folder: Path):
-    """
-    - <img> の src を処理（スペース -> %20、拡張子なし -> .png コピーを作って差し替え）
-    - <a> の href も同様（ローカル相対パスのみ）
-    """
-    mapping: Dict[str, str] = {}
-
-    # 画像（img）
-    for img in content_root.find_all("img"):
-        src = img.get("src")
-        if not src:
-            continue
-        new_rel, changed = ensure_png_copy_for_path(base_folder, src, mapping)
-        if changed:
-            src = new_rel
-        img["src"] = encode_spaces_and_normalize(src)
-
-    # アンカー（a）
-    for a in content_root.find_all("a"):
-        href = a.get("href")
-        if not href:
-            continue
-        new_rel, changed = ensure_png_copy_for_path(base_folder, href, mapping)
-        if changed:
-            href = new_rel
-        a["href"] = encode_spaces_and_normalize(href)
+    mapping[key] = dest_name
+    return dest_name, True
 
 def strip_after_comment_button(root: Tag):
     comment = root.find("div", class_="message-action-container")
@@ -139,7 +106,6 @@ def strip_after_comment_button(root: Tag):
             except Exception:
                 pass
     except Exception:
-        # 位置特定に失敗しても最低限コメントボタン自身を除去
         try:
             comment.decompose()
         except Exception:
@@ -217,7 +183,7 @@ def html_fragment_to_markdown(fragment_html: str) -> str:
     md = md.strip() + "\n"
     return md
 
-def convert_html_to_markdown(html_text: str, folder_path: Path, folder_name: str) -> str:
+def convert_html_to_markdown(html_text: str, base_folder: Path, out_folder: Path, folder_name: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
     content_root = soup.select_one("div.thread-message-content-body-text.thread-full-message")
     if content_root is None:
@@ -226,11 +192,32 @@ def convert_html_to_markdown(html_text: str, folder_path: Path, folder_name: str
             "<div class=\"thread-message-content-body-text thread-full-message\" ...>"
         )
 
-    # 画像とリンクの事前処理（スペース -> %20、拡張子なし画像 -> .png コピー＆差し替え）
-    preprocess_links_and_images(content_root, folder_path)
+    # 画像とリンクの事前処理（PNG系を出力先へコピー & リンクをファイル名へ）
+    mapping: Dict[str, str] = {}
+    for img in content_root.find_all("img"):
+        src = img.get("src")
+        if not src:
+            continue
+        new_name, changed = copy_image_to_outdir(base_folder, out_folder, src, mapping)
+        if changed:
+            src = new_name
+        img["src"] = encode_spaces(src)
+
+    for a in content_root.find_all("a"):
+        href = a.get("href")
+        if not href:
+            continue
+        new_name, changed = copy_image_to_outdir(base_folder, out_folder, href, mapping)
+        if changed:
+            href = new_name
+        a["href"] = encode_spaces(href)
 
     # コメントボタン以降を削除
     strip_after_comment_button(content_root)
+
+    # タイトル末尾の " - Microsoft コミュニティ" を削除
+    raw_title = soup.title.string.strip() if soup.title and soup.title.string else folder_name
+    stripped_title = re.sub(r"\s*-\s*Microsoft\s*コミュニティ\s*$", "", raw_title)
 
     # 空チェック
     if (not content_root.get_text(strip=True) and
@@ -238,9 +225,7 @@ def convert_html_to_markdown(html_text: str, folder_path: Path, folder_name: str
         error_exit("記事本文が空のようです。抽出範囲や保存形式を確認してください。")
 
     md_body = html_fragment_to_markdown(str(content_root))
-
-    page_title = soup.title.string.strip() if soup.title and soup.title.string else folder_name
-    final_md = f"# {page_title}\n\n{md_body.strip()}\n"
+    final_md = f"# {stripped_title}\n\n{md_body.strip()}\n"
     return final_md
 
 def main():
@@ -260,7 +245,7 @@ def main():
     except UnicodeDecodeError as e:
         error_exit(f"HTML の UTF-8 読み込みに失敗しました: {html_path}\n{e}")
 
-    md_text = convert_html_to_markdown(html_text, folder, folder.name)
+    md_text = convert_html_to_markdown(html_text, folder, folder, folder.name)
 
     try:
         out_md.write_text(md_text, encoding="utf-8", newline="\n")
