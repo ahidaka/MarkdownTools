@@ -2,34 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-AnswersToZenn.py
+AnswersToZenn.py (patched)
 
-Edge で保存した Microsoft Answers の Web アーカイブ（HTML + *_files）から、
-Zenn 形式の Markdown を生成します。
+WSL2での SyntaxError: f-string expression part cannot include a backslash
+の原因となっていた frontmatter 生成部の f-string 内式を修正。
+title のエスケープは事前に safe_title 変数で行います。
 
-出力:
-- articles/<slug>.md  （既存ならエラー停止・常に新規作成）
-- images/<slug>/ ...   （本文で参照される画像をコピー）
-
-仕様の要点:
-- 本文抽出は <div class="thread-message-content-body-text thread-full-message"> から
-  コメントボタン（div.message-action-container）まで。
-- Markdown の先頭に Zenn Frontmatter を付与。
-- title は元 HTML の <title> から末尾 " - Microsoft コミュニティ" を除去して使用。
-- slug は CLI 引数で受け取り、空でないことのみ検証（既存チェックはしない）。
-- 画像パスは /images/<slug>/<ファイル名> に書き換え（スペースは %20 にエンコード）。
-- ローカル画像が拡張子なしなら .png を付与してコピー（中身の形式は未判定）。
-- .png/.jpg/.jpeg/.gif/.webp/.bmp/.svg 等は拡張子ありのままコピー。
-- 外部 URL はそのまま（スペースのみ %20 化）。
-- 出力 Markdown が既に存在したらエラー終了。
-
-依存:
-  pip install beautifulsoup4
+機能仕様は前回版と同じです。
 """
 
 import sys, os, re, shutil, urllib.parse
 from pathlib import Path
-from typing import Tuple, Dict, Optional, Iterable
+from typing import Tuple, Dict, Optional
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 # ---- 固定 Frontmatter（必要時は書き換えて運用） ----
@@ -71,14 +55,14 @@ def ensure_copied_image(
     base_folder: Path,
     out_images_dir: Path,
     url_or_path: str,
-    mapping: Dict[str, str]
+    mapping: Dict[str, str],
+    slug: str
 ) -> Tuple[str, bool]:
     """
-    ローカル相対パスの画像を images/<slug>/ にコピーし、返り値として「/images/<slug>/<ファイル名>」を返す。
+    ローカル相対パスの画像を images/<slug>/ にコピーし、「/images/<slug>/<ファイル名>」を返す。
     - 拡張子なし -> .png を付与してコピー
     - 拡張子あり & IMAGE_EXTS -> その拡張子でコピー
     - 上記以外 -> 変更なし
-    mapping で同一入力の重複コピーを防止。
     """
     if not url_or_path or is_external(url_or_path) or url_or_path.startswith("#"):
         return url_or_path, False
@@ -96,14 +80,13 @@ def ensure_copied_image(
     elif abs_src.suffix == "":
         dest_name = abs_src.name + ".png"
     else:
-        # 画像拡張子ではないので対象外
         return url_or_path, False
 
     out_images_dir.mkdir(parents=True, exist_ok=True)
     dest_abs = out_images_dir / dest_name
     shutil.copyfile(abs_src, dest_abs)
 
-    new_url = f"/images/{out_images_dir.name}/{dest_name}"
+    new_url = f"/images/{slug}/{dest_name}"
     mapping[key] = new_url
     return new_url, True
 
@@ -219,7 +202,7 @@ def convert_to_zenn_md(
         src = img.get("src")
         if not src:
             continue
-        new_url, changed = ensure_copied_image(base_folder, out_images_dir, src, mapping)
+        new_url, changed = ensure_copied_image(base_folder, out_images_dir, src, mapping, slug)
         if changed:
             src = new_url
         img["src"] = encode_spaces(src)
@@ -228,7 +211,7 @@ def convert_to_zenn_md(
         href = a.get("href")
         if not href:
             continue
-        new_url, changed = ensure_copied_image(base_folder, out_images_dir, href, mapping)
+        new_url, changed = ensure_copied_image(base_folder, out_images_dir, href, mapping, slug)
         if changed:
             href = new_url
         a["href"] = encode_spaces(href)
@@ -243,18 +226,21 @@ def convert_to_zenn_md(
     # 本文 Markdown 生成
     md_body = html_fragment_to_markdown(str(content_root)).strip()
 
-    # Frontmatter 生成
+    # Frontmatter 生成（title のダブルクォートを事前にエスケープ）
+    safe_title = title.replace('"', '\\"')
     topics_yaml = ", ".join([f'"{t}"' for t in FM_TOPICS])
-    frontmatter = f"""---
-title: "{title.replace('"', '\\"')}"
-emoji: "{FM_EMOJI}"
-type: "{FM_TYPE}"
-topics: [{topics_yaml}]
-published: {"true" if FM_PUBLISHED else "false"}
-slug: "{slug}"
----
-
-"""
+    frontmatter_lines = [
+        "---",
+        f'title: "{safe_title}"',
+        f'emoji: "{FM_EMOJI}"',
+        f'type: "{FM_TYPE}"',
+        f"topics: [{topics_yaml}]",
+        f'published: {"true" if FM_PUBLISHED else "false"}',
+        f'slug: "{slug}"',
+        "---",
+        "",
+    ]
+    frontmatter = "\n".join(frontmatter_lines)
 
     return frontmatter + md_body + "\n"
 
